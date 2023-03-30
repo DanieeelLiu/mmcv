@@ -14,6 +14,7 @@
 #include "psamask_utils.hpp"
 #include "pytorch_device_registry.hpp"
 #include "pytorch_mlu_helper.hpp"
+#include "mlu_common_helper.h"
 
 #define COMPUTE_COUNT_ALIGN 64
 
@@ -167,43 +168,66 @@ void PSAMaskForwardMLUKernelLauncher(const int psa_type, const Tensor x,
     CNLOG(INFO) << "skip zero-element tensor";
     return;
   }
-
-  cnrtFunctionType_t k_type = CNRT_FUNC_TYPE_UNION1;
-  cnrtDim3_t k_dim;
-  PartitionSeg partition_info;
-  policyFunc(&k_dim, &k_type, &partition_info, num_, h_feature);
-  int n_limit_seg, h_limit_seg, w_limit_seg;
-  bool ret =
-      findLimit(partition_info.n_per_core, partition_info.h_per_core, w_feature,
-                x_c, y_c, &n_limit_seg, &h_limit_seg, &w_limit_seg, psa_type);
-  if (ret != true) {
-    return;
-  }
-
-  auto memory_format =
+ 
+  auto memory_format1 =
       torch_mlu::cnnl::ops::get_channels_last_memory_format(x.dim());
-  auto x_tensor = torch_mlu::cnnl::ops::cnnl_contiguous(x, memory_format);
-  at::Tensor y_tmp =
-      at::empty({num_, y_c, h_feature, w_feature}, x.options(), memory_format);
+  // auto x_tensor = torch_mlu::cnnl::ops::cnnl_contiguous(x, memory_format);
+  auto x_contiguous =
+        torch_mlu::cnnl::ops::cnnl_contiguous(x, memory_format1);
 
-  // get compute queue
-  auto queue = torch_mlu::getCurQueue();
+  printf("x_contiguous dims: %d, %d, %d, %d\n", x_contiguous.size(0),
+         x_contiguous.size(1), x_contiguous.size(2), x_contiguous.size(3));
 
-  // get ptr of tensors
-  auto x_impl = torch_mlu::getMluTensorImpl(x_tensor);
-  auto x_ptr = x_impl->cnnlMalloc();
-  auto y_impl = torch_mlu::getMluTensorImpl(y_tmp);
-  auto y_ptr = y_impl->cnnlMalloc();
+  auto memory_format2 =
+      torch_mlu::cnnl::ops::get_channels_last_memory_format(y.dim());
+  auto y_contiguous =
+        torch_mlu::cnnl::ops::cnnl_contiguous(y, y.suggest_memory_format());
 
-  KernelPsamaskForward(
-      k_dim, k_type, queue, x_ptr, y_ptr, (PsamaskType)psa_type,
-      partition_info.core_partition, partition_info.cluster_partition, num_,
-      h_feature, w_feature, h_mask, w_mask, x_c, y_c, half_h_mask, half_w_mask,
-      partition_info.n_per_core, partition_info.h_per_core,
-      partition_info.n_per_cluster, partition_info.h_per_cluster, n_limit_seg,
-      h_limit_seg, w_limit_seg);
+  printf("y_continues dims: %d, %d, %d, %d\n", y_contiguous.size(0),
+         y_contiguous.size(1), y_contiguous.size(2), y_contiguous.size(3));
+  
+  // at::Tensor y_tmp =
+  //     at::empty({num_, y_c, h_feature, w_feature}, x.options(), memory_format);
 
-  y.copy_(y_tmp);
+  // printf("y_temp dims: %d, %d, %d, %d\n", y_tmp.size(0),
+  //        y_tmp.size(1), y_tmp.size(2), y_tmp.size(3));
+  printf("2: num_ %d, h_feature: %d, w_feature: %d, h_mask: %d, w_mask: %d\n",
+          num_, h_feature, w_feature, h_mask, w_mask);
+  MluOpTensorDescriptor input_desc, output_desc;
+  input_desc.set_with_layout(x_contiguous, MLUOP_LAYOUT_NHWC);
+  output_desc.set_with_layout(y_contiguous, MLUOP_LAYOUT_NHWC);
+
+  auto handle = mluOpGetCurrentHandle();
+  auto input_impl = torch_mlu::getMluTensorImpl(x_contiguous);
+  auto output_impl = torch_mlu::getMluTensorImpl(y_contiguous);
+  auto input_ptr = input_impl->cnnlMalloc();
+  auto output_ptr = output_impl->cnnlMalloc();
+
+  mluOpPsamaskForward(handle, psa_type, input_desc.desc(), input_ptr,
+                      h_mask, w_mask, output_desc.desc(), output_ptr);
+  // y.copy_(y_tmp);
+
+  // at::Tensor y_tmp =
+  //     at::empty({num_, y_c, h_feature, w_feature}, x.options(), memory_format);
+
+  // // get compute queue
+  // auto queue = torch_mlu::getCurQueue();
+
+  // // get ptr of tensors
+  // auto x_impl = torch_mlu::getMluTensorImpl(x_tensor);
+  // auto x_ptr = x_impl->cnnlMalloc();
+  // auto y_impl = torch_mlu::getMluTensorImpl(y_tmp);
+  // auto y_ptr = y_impl->cnnlMalloc();
+
+  // KernelPsamaskForward(
+  //     k_dim, k_type, queue, x_ptr, y_ptr, (PsamaskType)psa_type,
+  //     partition_info.core_partition, partition_info.cluster_partition, num_,
+  //     h_feature, w_feature, h_mask, w_mask, x_c, y_c, half_h_mask, half_w_mask,
+  //     partition_info.n_per_core, partition_info.h_per_core,
+  //     partition_info.n_per_cluster, partition_info.h_per_cluster, n_limit_seg,
+  //     h_limit_seg, w_limit_seg);
+
+
 }
 
 void PSAMaskBackwardMLUKernelLauncher(const int psa_type, const Tensor dy,
